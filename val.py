@@ -110,6 +110,7 @@ def run(
         augment=False,  # augmented inference
         verbose=False,  # verbose output
         save_txt=False,  # save results to *.txt
+        save_metrics=True, # save results to csv file - added by ijeoma@audette.io
         save_hybrid=False,  # save label+prediction hybrid results to *.txt
         save_conf=False,  # save confidences in --save-txt labels
         save_json=False,  # save a COCO-JSON results file
@@ -278,6 +279,15 @@ def run(
         mp, mr, map50, map = p.mean(), r.mean(), ap50.mean(), ap.mean()
     nt = np.bincount(stats[3].astype(int), minlength=nc)  # number of targets per class
 
+    # inserted by ijeoma@audette.io to save output to text file - Sept 20, 2022
+    if save_metrics:
+        os.makedirs(str(save_dir / 'metrics'), exist_ok=True)
+        with open(str(save_dir / 'metrics' /'metrics.csv'), 'w') as fh:
+            fh.write(f'Class,Images,Labels,Precision,Recall,mAP@.5,mAP@.5:.95,conf_thres,iou_thres,task\n')
+            fh.write(f"all, {seen}, {nt.sum()}, {mp}, {mr}, {map50}, {map},{conf_thres},{iou_thres},{task}\n")
+            for i, c in enumerate(ap_class):
+                fh.write(f'{names[c]}, {seen}, {nt[c]}, {p[i]}, {r[i]}, {ap50[i]}, {ap[i]}, {conf_thres},{iou_thres},{task}\n')
+    
     # Print results
     pf = '%22s' + '%11i' * 2 + '%11.3g' * 4  # print format
     LOGGER.info(pf % ('all', seen, nt.sum(), mp, mr, map50, map))
@@ -353,6 +363,7 @@ def parse_opt():
     parser.add_argument('--augment', action='store_true', help='augmented inference')
     parser.add_argument('--verbose', action='store_true', help='report mAP by class')
     parser.add_argument('--save-txt', action='store_true', help='save results to *.txt')
+    parser.add_argument('--save-metrics', action='store_true', help='save stats to *.txt') # added by ijeoma@audette.io
     parser.add_argument('--save-hybrid', action='store_true', help='save label+prediction hybrid results to *.txt')
     parser.add_argument('--save-conf', action='store_true', help='save confidences in --save-txt labels')
     parser.add_argument('--save-json', action='store_true', help='save a COCO-JSON results file')
