@@ -1,15 +1,19 @@
-# YOLOv5 🚀 by Ultralytics, GPL-3.0 license
+# YOLOv5 🚀 by Ultralytics, AGPL-3.0 license
 """
 Common modules
 """
 
+import ast
+import contextlib
 import json
 import math
 import platform
 import warnings
+import zipfile
 from collections import OrderedDict, namedtuple
 from copy import copy
 from pathlib import Path
+from urllib.parse import urlparse
 
 import cv2
 import numpy as np
@@ -20,10 +24,11 @@ import torch.nn as nn
 from PIL import Image
 from torch.cuda import amp
 
+from utils import TryExcept
 from utils.dataloaders import exif_transpose, letterbox
 from utils.general import (LOGGER, ROOT, Profile, check_requirements, check_suffix, check_version, colorstr,
-                           increment_path, make_divisible, non_max_suppression, scale_coords, xywh2xyxy, xyxy2xywh,
-                           yaml_load)
+                           increment_path, is_jupyter, make_divisible, non_max_suppression, scale_boxes, xywh2xyxy,
+                           xyxy2xywh, yaml_load)
 from utils.plots import Annotator, colors, save_one_box
 from utils.torch_utils import copy_attr, smart_inference_mode
 
@@ -39,13 +44,13 @@ def autopad(k, p=None, d=1):  # kernel, padding, dilation
 
 class Conv(nn.Module):
     # Standard convolution with args(ch_in, ch_out, kernel, stride, padding, groups, dilation, activation)
-    act = nn.SiLU()  # default activation
+    default_act = nn.SiLU()  # default activation
 
     def __init__(self, c1, c2, k=1, s=1, p=None, g=1, d=1, act=True):
         super().__init__()
         self.conv = nn.Conv2d(c1, c2, k, s, autopad(k, p, d), groups=g, dilation=d, bias=False)
         self.bn = nn.BatchNorm2d(c2)
-        self.act = self.act if act is True else act if isinstance(act, nn.Module) else nn.Identity()
+        self.act = self.default_act if act is True else act if isinstance(act, nn.Module) else nn.Identity()
 
     def forward(self, x):
         return self.act(self.bn(self.conv(x)))
@@ -315,7 +320,7 @@ class DetectMultiBackend(nn.Module):
         #   TorchScript:                    *.torchscript
         #   ONNX Runtime:                   *.onnx
         #   ONNX OpenCV DNN:                *.onnx --dnn
-        #   OpenVINO:                       *.xml
+        #   OpenVINO:                       *_openvino_model
         #   CoreML:                         *.mlmodel
         #   TensorRT:                       *.engine
         #   TensorFlow SavedModel:          *_saved_model
@@ -327,11 +332,13 @@ class DetectMultiBackend(nn.Module):
 
         super().__init__()
         w = str(weights[0] if isinstance(weights, list) else weights)
-        pt, jit, onnx, xml, engine, coreml, saved_model, pb, tflite, edgetpu, tfjs, paddle = self._model_type(w)  # type
-        w = attempt_download(w)  # download if not local
-        fp16 &= pt or jit or onnx or engine  # FP16
+        pt, jit, onnx, xml, engine, coreml, saved_model, pb, tflite, edgetpu, tfjs, paddle, triton = self._model_type(w)
+        fp16 &= pt or jit or onnx or engine or triton  # FP16
+        nhwc = coreml or saved_model or pb or tflite or edgetpu  # BHWC formats (vs torch BCWH)
         stride = 32  # default stride
         cuda = torch.cuda.is_available() and device.type != 'cpu'  # use CUDA
+        if not (pt or triton):
+            w = attempt_download(w)  # download if not local
 
         if pt:  # PyTorch
             model = attempt_load(weights if isinstance(weights, list) else w, device=device, inplace=True, fuse=fuse)
@@ -342,12 +349,13 @@ class DetectMultiBackend(nn.Module):
         elif jit:  # TorchScript
             LOGGER.info(f'Loading {w} for TorchScript inference...')
             extra_files = {'config.txt': ''}  # model metadata
-            model = torch.jit.load(w, _extra_files=extra_files)
+            model = torch.jit.load(w, _extra_files=extra_files, map_location=device)
             model.half() if fp16 else model.float()
             if extra_files['config.txt']:  # load metadata dict
                 d = json.loads(extra_files['config.txt'],
-                               object_hook=lambda d: {int(k) if k.isdigit() else k: v
-                                                      for k, v in d.items()})
+                               object_hook=lambda d: {
+                                   int(k) if k.isdigit() else k: v
+                                   for k, v in d.items()})
                 stride, names = int(d['stride']), d['names']
         elif dnn:  # ONNX OpenCV DNN
             LOGGER.info(f'Loading {w} for ONNX OpenCV DNN inference...')
@@ -372,11 +380,11 @@ class DetectMultiBackend(nn.Module):
                 w = next(Path(w).glob('*.xml'))  # get *.xml file from *_openvino_model dir
             network = ie.read_model(model=w, weights=Path(w).with_suffix('.bin'))
             if network.get_parameters()[0].get_layout().empty:
-                network.get_parameters()[0].set_layout(Layout("NCHW"))
+                network.get_parameters()[0].set_layout(Layout('NCHW'))
             batch_dim = get_batch(network)
             if batch_dim.is_static:
                 batch_size = batch_dim.get_length()
-            executable_network = ie.compile_model(network, device_name="CPU")  # device_name="MYRIAD" for Intel NCS2
+            executable_network = ie.compile_model(network, device_name='CPU')  # device_name="MYRIAD" for Intel NCS2
             stride, names = self._load_metadata(Path(w).with_suffix('.yaml'))  # load metadata
         elif engine:  # TensorRT
             LOGGER.info(f'Loading {w} for TensorRT inference...')
@@ -423,7 +431,7 @@ class DetectMultiBackend(nn.Module):
             import tensorflow as tf
 
             def wrap_frozen_graph(gd, inputs, outputs):
-                x = tf.compat.v1.wrap_function(lambda: tf.compat.v1.import_graph_def(gd, name=""), [])  # wrapped
+                x = tf.compat.v1.wrap_function(lambda: tf.compat.v1.import_graph_def(gd, name=''), [])  # wrapped
                 ge = x.graph.as_graph_element
                 return x.prune(tf.nest.map_structure(ge, inputs), tf.nest.map_structure(ge, outputs))
 
@@ -437,7 +445,7 @@ class DetectMultiBackend(nn.Module):
             gd = tf.Graph().as_graph_def()  # TF GraphDef
             with open(w, 'rb') as f:
                 gd.ParseFromString(f.read())
-            frozen_func = wrap_frozen_graph(gd, inputs="x:0", outputs=gd_outputs(gd))
+            frozen_func = wrap_frozen_graph(gd, inputs='x:0', outputs=gd_outputs(gd))
         elif tflite or edgetpu:  # https://www.tensorflow.org/lite/guide/python#install_tensorflow_lite_for_python
             try:  # https://coral.ai/docs/edgetpu/tflite-python/#update-existing-tf-lite-code-for-the-edge-tpu
                 from tflite_runtime.interpreter import Interpreter, load_delegate
@@ -457,6 +465,12 @@ class DetectMultiBackend(nn.Module):
             interpreter.allocate_tensors()  # allocate
             input_details = interpreter.get_input_details()  # inputs
             output_details = interpreter.get_output_details()  # outputs
+            # load metadata
+            with contextlib.suppress(zipfile.BadZipFile):
+                with zipfile.ZipFile(w, 'r') as model:
+                    meta_file = model.namelist()[0]
+                    meta = ast.literal_eval(model.read(meta_file).decode('utf-8'))
+                    stride, names = int(meta['stride']), meta['names']
         elif tfjs:  # TF.js
             raise NotImplementedError('ERROR: YOLOv5 TF.js inference is not supported')
         elif paddle:  # PaddlePaddle
@@ -464,7 +478,7 @@ class DetectMultiBackend(nn.Module):
             check_requirements('paddlepaddle-gpu' if cuda else 'paddlepaddle')
             import paddle.inference as pdi
             if not Path(w).is_file():  # if not *.pdmodel
-                w = next(Path(w).rglob('*.pdmodel'))  # get *.xml file from *_openvino_model dir
+                w = next(Path(w).rglob('*.pdmodel'))  # get *.pdmodel file from *_paddle_model dir
             weights = Path(w).with_suffix('.pdiparams')
             config = pdi.Config(str(w), str(weights))
             if cuda:
@@ -472,6 +486,12 @@ class DetectMultiBackend(nn.Module):
             predictor = pdi.create_predictor(config)
             input_handle = predictor.get_input_handle(predictor.get_input_names()[0])
             output_names = predictor.get_output_names()
+        elif triton:  # NVIDIA Triton Inference Server
+            LOGGER.info(f'Using {w} as Triton Inference Server...')
+            check_requirements('tritonclient[all]')
+            from utils.triton import TritonRemoteModel
+            model = TritonRemoteModel(url=w)
+            nhwc = model.runtime.startswith('tensorflow')
         else:
             raise NotImplementedError(f'ERROR: {w} is not a supported format')
 
@@ -488,6 +508,8 @@ class DetectMultiBackend(nn.Module):
         b, ch, h, w = im.shape  # batch, channel, height, width
         if self.fp16 and im.dtype != torch.float16:
             im = im.half()  # to FP16
+        if self.nhwc:
+            im = im.permute(0, 2, 3, 1)  # torch BCHW to numpy BHWC shape(1,320,192,3)
 
         if self.pt:  # PyTorch
             y = self.model(im, augment=augment, visualize=visualize) if augment or visualize else self.model(im)
@@ -517,9 +539,9 @@ class DetectMultiBackend(nn.Module):
             self.context.execute_v2(list(self.binding_addrs.values()))
             y = [self.bindings[x].data for x in sorted(self.output_names)]
         elif self.coreml:  # CoreML
-            im = im.permute(0, 2, 3, 1).cpu().numpy()  # torch BCHW to numpy BHWC shape(1,320,192,3)
+            im = im.cpu().numpy()
             im = Image.fromarray((im[0] * 255).astype('uint8'))
-            # im = im.resize((192, 320), Image.ANTIALIAS)
+            # im = im.resize((192, 320), Image.BILINEAR)
             y = self.model.predict({'image': im})  # coordinates are xywh normalized
             if 'confidence' in y:
                 box = xywh2xyxy(y['coordinates'] * [[w, h, w, h]])  # xyxy pixels
@@ -532,8 +554,10 @@ class DetectMultiBackend(nn.Module):
             self.input_handle.copy_from_cpu(im)
             self.predictor.run()
             y = [self.predictor.get_output_handle(x).copy_to_cpu() for x in self.output_names]
+        elif self.triton:  # NVIDIA Triton Inference Server
+            y = self.model(im)
         else:  # TensorFlow (SavedModel, GraphDef, Lite, Edge TPU)
-            im = im.permute(0, 2, 3, 1).cpu().numpy()  # torch BCHW to numpy BHWC shape(1,320,192,3)
+            im = im.cpu().numpy()
             if self.saved_model:  # SavedModel
                 y = self.model(im, training=False) if self.keras else self.model(im)
             elif self.pb:  # GraphDef
@@ -566,8 +590,8 @@ class DetectMultiBackend(nn.Module):
 
     def warmup(self, imgsz=(1, 3, 640, 640)):
         # Warmup model by running inference once
-        warmup_types = self.pt, self.jit, self.onnx, self.engine, self.saved_model, self.pb
-        if any(warmup_types) and self.device.type != 'cpu':
+        warmup_types = self.pt, self.jit, self.onnx, self.engine, self.saved_model, self.pb, self.triton
+        if any(warmup_types) and (self.device.type != 'cpu' or self.triton):
             im = torch.empty(*imgsz, dtype=torch.half if self.fp16 else torch.float, device=self.device)  # input
             for _ in range(2 if self.jit else 1):  #
                 self.forward(im)  # warmup
@@ -575,14 +599,17 @@ class DetectMultiBackend(nn.Module):
     @staticmethod
     def _model_type(p='path/to/model.pt'):
         # Return model type from model path, i.e. path='path/to/model.onnx' -> type=onnx
+        # types = [pt, jit, onnx, xml, engine, coreml, saved_model, pb, tflite, edgetpu, tfjs, paddle]
         from export import export_formats
-        sf = list(export_formats().Suffix) + ['.xml']  # export suffixes
-        check_suffix(p, sf)  # checks
-        p = Path(p).name  # eliminate trailing separators
-        pt, jit, onnx, xml, engine, coreml, saved_model, pb, tflite, edgetpu, tfjs, paddle, xml2 = (s in p for s in sf)
-        xml |= xml2  # *_openvino_model or *.xml
-        tflite &= not edgetpu  # *.tflite
-        return pt, jit, onnx, xml, engine, coreml, saved_model, pb, tflite, edgetpu, tfjs, paddle
+        from utils.downloads import is_url
+        sf = list(export_formats().Suffix)  # export suffixes
+        if not is_url(p, check=False):
+            check_suffix(p, sf)  # checks
+        url = urlparse(p)  # if url may be Triton inference server
+        types = [s in Path(p).name for s in sf]
+        types[8] &= not types[9]  # tflite &= not edgetpu
+        triton = not any(types) and all([any(s in url.scheme for s in ['http', 'grpc']), url.netloc])
+        return types + [triton]
 
     @staticmethod
     def _load_metadata(f=Path('path/to/meta.yaml')):
@@ -665,9 +692,9 @@ class AutoShape(nn.Module):
                 s = im.shape[:2]  # HWC
                 shape0.append(s)  # image shape
                 g = max(size) / max(s)  # gain
-                shape1.append([y * g for y in s])
+                shape1.append([int(y * g) for y in s])
                 ims[i] = im if im.data.contiguous else np.ascontiguousarray(im)  # update
-            shape1 = [make_divisible(x, self.stride) for x in np.array(shape1).max(0)] if self.pt else size  # inf shape
+            shape1 = [make_divisible(x, self.stride) for x in np.array(shape1).max(0)]  # inf shape
             x = [letterbox(im, shape1, auto=False)[0] for im in ims]  # pad
             x = np.ascontiguousarray(np.array(x).transpose((0, 3, 1, 2)))  # stack and BHWC to BCHW
             x = torch.from_numpy(x).to(p.device).type_as(p) / 255  # uint8 to fp16/32
@@ -687,7 +714,7 @@ class AutoShape(nn.Module):
                                         self.multi_label,
                                         max_det=self.max_det)  # NMS
                 for i in range(n):
-                    scale_coords(shape1, y[i][:, :4], shape0[i])
+                    scale_boxes(shape1, y[i][:, :4], shape0[i])
 
             return Detections(ims, y, files, dt, self.names, x.shape)
 
@@ -740,7 +767,11 @@ class Detections:
 
             im = Image.fromarray(im.astype(np.uint8)) if isinstance(im, np.ndarray) else im  # from np
             if show:
-                im.show(self.files[i])  # show
+                if is_jupyter():
+                    from IPython.display import display
+                    display(im)
+                else:
+                    im.show(self.files[i])
             if save:
                 f = self.files[i]
                 im.save(save_dir / f)  # save
@@ -756,15 +787,16 @@ class Detections:
                 LOGGER.info(f'Saved results to {save_dir}\n')
             return crops
 
+    @TryExcept('Showing images is not supported in this environment')
     def show(self, labels=True):
         self._run(show=True, labels=labels)  # show results
 
-    def save(self, labels=True, save_dir='runs/detect/exp'):
-        save_dir = increment_path(save_dir, exist_ok=save_dir != 'runs/detect/exp', mkdir=True)  # increment save_dir
+    def save(self, labels=True, save_dir='runs/detect/exp', exist_ok=False):
+        save_dir = increment_path(save_dir, exist_ok, mkdir=True)  # increment save_dir
         self._run(save=True, labels=labels, save_dir=save_dir)  # save results
 
-    def crop(self, save=True, save_dir='runs/detect/exp'):
-        save_dir = increment_path(save_dir, exist_ok=save_dir != 'runs/detect/exp', mkdir=True) if save else None
+    def crop(self, save=True, save_dir='runs/detect/exp', exist_ok=False):
+        save_dir = increment_path(save_dir, exist_ok, mkdir=True) if save else None
         return self._run(crop=True, save=save, save_dir=save_dir)  # crop results
 
     def render(self, labels=True):
@@ -818,12 +850,19 @@ class Proto(nn.Module):
 
 class Classify(nn.Module):
     # YOLOv5 classification head, i.e. x(b,c1,20,20) to x(b,c2)
-    def __init__(self, c1, c2, k=1, s=1, p=None, g=1):  # ch_in, ch_out, kernel, stride, padding, groups
+    def __init__(self,
+                 c1,
+                 c2,
+                 k=1,
+                 s=1,
+                 p=None,
+                 g=1,
+                 dropout_p=0.0):  # ch_in, ch_out, kernel, stride, padding, groups, dropout probability
         super().__init__()
         c_ = 1280  # efficientnet_b0 size
         self.conv = Conv(c1, c_, k, s, autopad(k, p), g)
         self.pool = nn.AdaptiveAvgPool2d(1)  # to x(b,c_,1,1)
-        self.drop = nn.Dropout(p=0.0, inplace=True)
+        self.drop = nn.Dropout(p=dropout_p, inplace=True)
         self.linear = nn.Linear(c_, c2)  # to x(b,c2)
 
     def forward(self, x):
